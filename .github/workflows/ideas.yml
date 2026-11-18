@@ -1,0 +1,46 @@
+# Copie non officielle des données publiques IDEeS du ministère de la Défense nationale.
+# Reproduction non commerciale, sans association avec le gouvernement du Canada ni son appui.
+# Source et conditions : https://www.canada.ca/fr/transparence/avis.html
+name: Synchroniser IDEeS public
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '5 10,11 * * *'
+permissions:
+  contents: write
+concurrency:
+  group: ideas-government-mirror
+  cancel-in-progress: false
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Collect and validate the official public dataset
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          node <<'NODE'
+          const {createHash}=require('node:crypto');
+          const sourceUrl='https://www.canada.ca/content/dam/dnd-mdn/documents/json/ideas-funded-projects.json';
+          async function readJson(response,max=6000000){if(!response.ok)throw Error('HTTP '+response.status);const reader=response.body.getReader();let bytes=0,text='';const decoder=new TextDecoder();try{for(;;){const r=await reader.read();if(r.done)break;bytes+=r.value.byteLength;if(bytes>max)throw Error('Response too large');text+=decoder.decode(r.value,{stream:true});}return JSON.parse(text+decoder.decode());}finally{await reader.cancel().catch(()=>{});}}
+          async function main(){
+           const payload=await readJson(await fetch(sourceUrl,{signal:AbortSignal.timeout(60000),redirect:'error'}));
+           if(!Array.isArray(payload?.data)||!payload.data.length||payload.data.length>10000)throw Error('Invalid official dataset');
+           const qc=payload.data.filter(r=>String(r.province_f||r.province_e||'').normalize('NFD').replace(/[\u0300-\u036f]/g,'').toUpperCase()==='QUEBEC');
+           if(!qc.length||qc.length>3000)throw Error('Invalid Quebec project count');
+           for(const r of qc){if(typeof r.innovator!=='string'||!r.innovator.trim()||r.innovator.length>1000||typeof r.project_title!=='string'||!r.project_title.trim()||r.project_title.length>3000)throw Error('Incomplete project');if(r.funding!=null&&r.funding!==''&&!Number.isFinite(Number(r.funding)))throw Error('Invalid funding');}
+           const sha256=createHash('sha256').update(JSON.stringify(payload)).digest('hex');
+           const envelope={sourceUrl,fetchedAt:new Date().toISOString(),sha256,payload};
+           if(Buffer.byteLength(JSON.stringify(envelope))>6000000)throw Error('Dataset too large');
+           const repository=process.env.GITHUB_REPOSITORY;if(!/^[A-Za-z0-9-]+\/[A-Za-z0-9_.-]+$/.test(repository||''))throw Error('Invalid repository');
+           const endpoint='https://api.github.com/repos/'+repository+'/contents/data/ideas-funded-projects.json';
+           const headers={Accept:'application/vnd.github+json',Authorization:'Bearer '+process.env.GH_TOKEN,'X-GitHub-Api-Version':'2022-11-28','Content-Type':'application/json'};
+           const current=await fetch(endpoint+'?ref=main',{headers,signal:AbortSignal.timeout(30000)});let sha;if(current.status===200)sha=(await readJson(current,12000000)).sha;else if(current.status!==404)throw Error('GitHub read HTTP '+current.status);
+           const saved=await fetch(endpoint,{method:'PUT',headers,body:JSON.stringify({message:'Refresh public IDEeS government dataset',branch:'main',sha,content:Buffer.from(JSON.stringify(envelope)+'\n').toString('base64')}),signal:AbortSignal.timeout(30000)});
+           if(!saved.ok)throw Error('GitHub write HTTP '+saved.status);
+           console.log(JSON.stringify({projects:payload.data.length,quebec:qc.length,sha256,fetchedAt:envelope.fetchedAt}));
+          }
+          main().catch(e=>{console.error(e.message);process.exitCode=1;});
+          NODE
